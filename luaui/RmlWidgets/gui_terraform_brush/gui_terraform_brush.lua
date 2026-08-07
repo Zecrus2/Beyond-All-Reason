@@ -280,6 +280,7 @@ widgetState = {  -- forward-declared above playSound so mute check works
 	envDimensionsRootEl = nil,
 	splatTexRootEl = nil,
 	grassCfgRootEl = nil,
+	captureOpen = false,
 	envSunOpen = false,
 	envFogOpen = false,
 	envGroundLightingOpen = false,
@@ -318,6 +319,11 @@ widgetState = {  -- forward-declared above playSound so mute check works
 	fullRestoreConfirmExpiry = 0,
 	-- Metal clean confirm state
 	metalCleanConfirmExpiry = 0,
+	-- Open Project: selected row, DELETE confirm window, row elements to repaint
+	projectOpenSelectedSlug = nil,
+	projectDeleteConfirmExpiry = 0,
+	projectOpenRowEls = {},  -- {{slug = ..., el = ...}, ...} for selection painting
+	projectOpenNeedsRebuild = false,  -- set by a delete, consumed in Update
 	-- Auto-scroll transport state (per-slider, keyed by slider element id)
 	transports = {},
 	-- Currently focused RmlUI input element (text/number boxes); cleared on blur.
@@ -675,7 +681,17 @@ local function applySkyboxNow(boundTexName, rawPath)
 	local name = boundTexName
 	if not name or name == "" then name = rawPath end
 	if not name or name == "" then return end
+	-- Swapping the skybox makes the engine re-derive sky state from mapinfo,
+	-- which stomps the LIVE fog params back to the map's baked values — fog
+	-- reappears while the ENV sliders still show the runtime values (seen on
+	-- biome skybox sync on loaded maps). Snapshot fog and re-assert it after.
+	local fogS = gl.GetAtmosphere("fogStart")
+	local fogE = gl.GetAtmosphere("fogEnd")
+	local fR, fG, fB, fA = gl.GetAtmosphere("fogColor")
 	Spring.SetSkyBoxTexture(name)
+	if fogS and fogE then
+		Spring.SetAtmosphere({ fogStart = fogS, fogEnd = fogE, fogColor = { fR or 0.7, fG or 0.7, fB or 0.8, fA or 0 } })
+	end
 end
 
 -- Start a skybox fade transition (screen overlay fade-to-black)
@@ -751,7 +767,8 @@ widgetState.applySkybox = applySkybox
 local IS_BAR = (Game.gameName or ""):find("Beyond All Reason") ~= nil
 local BIOME_SKYBOX_MATCH = {
 	bismuth     = "spaceskybox",      -- starry sky
-	teizer      = "goldsunrise",      -- sunset
+	teizer      = "goldsunrise",      -- sunset (bespoke desert kept the old pick)
+	protodesert = "goldsunrise",      -- the renamed original Teizer stand-in set
 	enborelde   = "earthskybox",      -- sunny blue sky with clouds
 	namaqualand = "redplanet",        -- red desert planet
 	palehang    = "allthatglitters",  -- crystal-desert sky (Theta Crystals family)
@@ -849,6 +866,42 @@ local function buildRootStyle()
 	-- emit position here so dragging can override it inline.
 	return string.format("left: %.2fvw; top: %.2fvh;",
 		currentLeftVw, currentTopVh)
+end
+
+-- Every floating window pins its header and puts the rest of its content in a
+-- `.tf-panel-body` scroll box (see the RML). Capping those to the space left
+-- below each window is shared work across the whole editor suite, so it lives
+-- in WG.TerraformerShared; this is just the "re-measure now" nudge for the
+-- moments this widget knows about. Defined on widgetState rather than as a
+-- file local — this chunk is close to Lua 5.1's 200-local ceiling.
+function widgetState.refreshPanelBodies()
+	local ts = WG.TerraformerShared
+	if ts and ts.refreshPanelBodies then ts.refreshPanelBodies() end
+end
+
+-- GL overlays that paint on top of a panel element (texture previews) have to
+-- be clipped to the scroll box that element lives in — RmlUi clips its own
+-- rendering, but a raw gl.TexRect would keep painting over the pinned header or
+-- past the bottom of the panel once the content is scrolled. Returns true when
+-- a scissor was pushed; the caller must then gl.Scissor(false).
+function widgetState.pushPanelClip(el)
+	local vsy = select(2, GetViewGeometry())
+	if not vsy or vsy <= 0 then return false end
+	local node = el
+	while node do
+		if node:IsClassSet("tf-panel-body") then
+			local w, h = node.offset_width, node.offset_height
+			if w > 0 and h > 0 then
+				gl.Scissor(math.floor(node.absolute_left),
+					math.floor(vsy - node.absolute_top - h),
+					math.ceil(w), math.ceil(h))
+				return true
+			end
+			return false
+		end
+		node = node.parent_node
+	end
+	return false
 end
 
 -- Forward declaration: clearPassthrough is defined after initialModel but captured as upvalue
@@ -1795,6 +1848,44 @@ local function buildBlankMapStartScript(widthUnits, heightUnits, dntsSet, skybox
 	-- placement anywhere.
 	script = script:gsub("[Ss][Tt][Aa][Rr][Tt][Rr][Ee][Cc][Tt][A-Za-z]*%s*=[^;\r\n]*;?", "")
 
+	-- Startboxes have a SECOND source that the startrect strip above does not
+	-- cover: the lobby's mapmetadata_startbox* modoptions. game_startbox_config
+	-- decodes them into polygons, calls Spring.SetAllyTeamStartBox and enforces
+	-- them through GG.IsInsideStartbox, so inheriting them from a session that
+	-- was launched on a real map re-creates the dead-mouse symptom on the
+	-- canvas — placement silently confined to a band, scaled to the new map
+	-- size (the polygons are proportional, not absolute). Without them the
+	-- gadget falls back to a non-explicit config, which never restricts.
+	local function stripKeyCI(text, key)
+		local pattern = key:gsub("%a", function(c)
+			return "[" .. c:upper() .. c:lower() .. "]"
+		end)
+		return (text:gsub(pattern .. "%s*=[^;\r\n]*;?", ""))
+	end
+	script = stripKeyCI(script, "mapmetadata_startboxes_set")
+	script = stripKeyCI(script, "mapmetadata_startbox_override")
+
+	-- Stripping alone is NOT enough: with no startrect keys the engine falls back
+	-- to its own default rect for the allyteam, and the engine resolves the
+	-- pregame placement click against that rect BEFORE any Lua callin runs — so
+	-- clicks land only near the default rect (observed: only the map corner
+	-- accepted a commander, flat ground mid-map did nothing). Write an explicit
+	-- full-map rect into every allyteam block instead, which is what an editor
+	-- canvas wants: place anywhere. Fractions of map size, 0..1.
+	script = script:gsub("(%[[Aa][Ll][Ll][Yy][Tt][Ee][Aa][Mm]%d+%]%s*\r?\n?%s*{)",
+		"%1\nstartrectleft=0;\nstartrecttop=0;\nstartrectright=1;\nstartrectbottom=1;")
+
+	-- Editor sessions must never end: with deathmode=neverend both game_end and
+	-- game_team_com_ends remove themselves at init, so teams survive with zero
+	-- units (edit without commanders) and commander death cannot end the session.
+	script = script:gsub("[Dd][Ee][Aa][Tt][Hh][Mm][Oo][Dd][Ee]%s*=[^;\r\n]*;?", "")
+	local needModoptions = true
+	local _, moE = script:find("%[[Mm][Oo][Dd][Oo][Pp][Tt][Ii][Oo][Nn][Ss]%]%s*\r?\n?%s*{")
+	if moE then
+		script = script:sub(1, moE) .. "\ndeathmode=neverend;" .. script:sub(moE + 1)
+		needModoptions = false
+	end
+
 	-- Swap the map name (the generator uses it as the generated map's label).
 	if script:find("[Mm][Aa][Pp][Nn][Aa][Mm][Ee]%s*=") then
 		script = (script:gsub("[Mm][Aa][Pp][Nn][Aa][Mm][Ee]%s*=[^;\r\n]*;?", "mapname=" .. mapName .. ";", 1))
@@ -1845,14 +1936,23 @@ local function buildBlankMapStartScript(widthUnits, heightUnits, dntsSet, skybox
 		opt[#opt + 1] = "blank_map_splatdetailnormaldiffusealpha=" .. (dntsSet.diffuseAlpha == 1 and 1 or 0) .. ";"
 	end
 
-	local inject = table.concat({
+	local injectParts = {
 		"InitBlank=1;",
 		"MapSeed=" .. seed .. ";",
 		"[mapoptions]",
 		"{",
 		table.concat(opt, "\n"),
 		"}",
-	}, "\n")
+	}
+	-- Source script had no [modoptions] block to receive deathmode=neverend:
+	-- create one at game scope alongside the [mapoptions] injection.
+	if needModoptions then
+		injectParts[#injectParts + 1] = "[modoptions]"
+		injectParts[#injectParts + 1] = "{"
+		injectParts[#injectParts + 1] = "deathmode=neverend;"
+		injectParts[#injectParts + 1] = "}"
+	end
+	local inject = table.concat(injectParts, "\n")
 
 	-- Insert immediately after the opening brace of the [game] block so the new
 	-- keys sit at game scope alongside mapname/modoptions.
@@ -2008,6 +2108,97 @@ do
 	if ok and type(t) == "table" then widgetState.newMapArchetypes = t end
 end
 
+-- ---- Capture (top-down map photo + per-unit SVG layer) ----
+-- The work lives in cmd_terraform_brush_capture.lua; this side owns the window,
+-- mirrors that widget's settings into the data model, and keeps the
+-- size/tiles/time readout live. A capture hijacks the camera for seconds and can
+-- write a 12k-square PNG, so the cost is always on screen before CAPTURE is
+-- pressed rather than discovered afterwards.
+-- Grouped into one table on purpose: this chunk sits near Lua 5.1's 200-local
+-- ceiling, so new file-level helpers go on a namespace rather than each taking
+-- a slot.
+local capUI = {}
+
+function capUI.readout()
+	local api = WG.TerraformCapture
+	if not (api and api.estimate) then return "Capture widget is not enabled", "" end
+	local ok, est = pcall(api.estimate)
+	if not ok or type(est) ~= "table" then return "unavailable", "" end
+	-- Tight separators: this line lives in a 220dp panel and should stay on one row.
+	local readout = string.format("%d\195\151%d px \194\183 %d tiles \194\183 ~%ds",
+		est.outW, est.outH, est.tiles, math.max(1, math.floor(est.seconds + 0.5)))
+	local warn = ""
+	if est.capped then
+		warn = string.format("%sx is wider than this GPU's %d px texture limit \226\128\148 capturing at %.2fx.",
+			tostring(est.detail), est.maxTex, est.effectiveDetail)
+	elseif est.strips then
+		-- Not an error: too big for one image, so it lands as horizontal strips
+		-- whose filenames carry their Y offset. Say so before CAPTURE is pressed.
+		warn = "Too big for one image \226\128\148 saves as horizontal strips (Y offset in each filename)."
+	end
+	return readout, warn
+end
+
+function capUI.sync()
+	local d = widgetState.dmHandle
+	if not d then return end
+	local api = WG.TerraformCapture
+	if api and api.getSettings then
+		local s = api.getSettings()
+		d.captureDetail         = tostring(s.detail)
+		d.capturePhotoWater     = s.photoWater and true or false
+		d.capturePhotoShadows   = s.photoShadows and true or false
+		d.capturePhotoBloom     = s.photoBloom and true or false
+		d.capturePhotoFog       = s.photoFog and true or false
+		d.capturePhotoFeatures  = s.photoFeatures and true or false
+		d.captureUnitLayer      = s.unitLayer and true or false
+		d.captureUnitStyle      = tostring(s.unitStyle)
+		d.captureUnitSizeStr    = tostring(math.floor(s.unitSize))
+		d.captureUnitScalingStr = string.format("%.2f", s.unitScaling)
+		d.captureGroupTeam      = s.unitGroupTeam and true or false
+		d.captureLabels         = s.unitLabels and true or false
+		d.captureFeatureLayer   = s.featureLayer and true or false
+		d.captureCommentLayer   = s.commentLayer and true or false
+		d.capturePortraitOpts   = (s.unitLayer and s.unitStyle == "portrait") and true or false
+	end
+	local readout, warn = capUI.readout()
+	d.captureReadout = readout
+	d.captureWarn = warn
+end
+
+-- Result bar. Two booleans rather than one flag plus a compound data expression,
+-- matching the rest of this document's bindings.
+function capUI.setResult(ok, head, body)
+	local d = widgetState.dmHandle
+	if not d then return end
+	local shown = (body ~= nil and body ~= "")
+	d.captureResultOk   = (shown and ok) and true or false
+	d.captureResultBad  = (shown and not ok) and true or false
+	d.captureResultHead = shown and (head or "") or ""
+	d.captureResult     = shown and body or ""
+end
+
+-- Sliders are plain elements, not data-bound, so their handle position has to be
+-- pushed on open (guarded, or the change listener would echo it straight back).
+function capUI.syncSliders()
+	local doc = widgetState.document
+	local api = WG.TerraformCapture
+	if not (doc and api and api.getSettings) then return end
+	local s = api.getSettings()
+	uiState.updatingFromCode = true
+	local elSize = doc:GetElementById("slider-capture-unitsize")
+	if elSize then elSize:SetAttribute("value", tostring(math.floor(s.unitSize))) end
+	local elScale = doc:GetElementById("slider-capture-unitscaling")
+	if elScale then elScale:SetAttribute("value", tostring(math.floor(s.unitScaling * 100 + 0.5))) end
+	uiState.updatingFromCode = false
+end
+
+function capUI.set(key, value)
+	local api = WG.TerraformCapture
+	if api and api.setSetting then api.setSetting(key, value) end
+	capUI.sync()
+end
+
 local initialModel = {
 	radius = 100,
 	shapeName = "Circle",
@@ -2023,6 +2214,36 @@ local initialModel = {
 	passthroughActive = false,
 	settingsOpen = false,
 	settingsTab = "keybinds",
+	-- Map Labels window (gui_map_labels widget) — header button highlight
+	mapLabelsOpen = false,
+	-- Capture window (cmd_terraform_brush_capture.lua does the rendering)
+	captureOpen = false,
+	captureVisible = false,
+	captureDetail = "1",
+	capturePhotoWater = true,
+	capturePhotoShadows = true,
+	capturePhotoBloom = true,
+	capturePhotoFog = false,
+	capturePhotoFeatures = true,
+	captureUnitLayer = true,
+	captureUnitStyle = "portrait",
+	-- Computed rather than an "&&" data expression: nothing else in this
+	-- document's bindings uses compound operators, so keep the RML trivial.
+	capturePortraitOpts = true,
+	captureUnitSizeStr = "96",
+	captureUnitScalingStr = "0.35",
+	captureGroupTeam = true,
+	captureLabels = false,
+	captureFeatureLayer = false,
+	captureCommentLayer = false,
+	captureReadout = "",
+	captureWarn = "",
+	captureBusy = false,
+	captureProgress = "",
+	captureResult = "",
+	captureResultHead = "",
+	captureResultOk = false,
+	captureResultBad = false,
 	noiseWindowVisible = false,
 	-- FILE menu + New Map dialog
 	fileMenuOpen = false,
@@ -2030,9 +2251,12 @@ local initialModel = {
 	-- Save Project dialog (FILE > Save Project, backed by WG.MapProject)
 	projectSaveOpen = false,
 	projectSaveHint = "",
+	projectSaveUnits = false,  -- "save units loadout" toggle (position/team of every unit)
 	-- Open Project dialog (FILE > Open Project, backed by WG.MapProject)
 	projectOpenOpen = false,
 	projectOpenHint = "",
+	projectOpenSelected = "",       -- display name of the picked row ("" = nothing picked)
+	projectDeleteConfirming = false,  -- DELETE armed, waiting for the second click
 	newMapWidthStr = "12",
 	newMapHeightStr = "12",
 	newMapElmoStr = "6144 x 6144 elmos",
@@ -2137,6 +2361,13 @@ local initialModel = {
 	fpMeasureStickyMode = false,
 	fpSymMirrorX = false,
 	fpSymMirrorY = false,
+	-- features placer gizmo selection. fpShowSelection/fpShowReroll are combined
+	-- in Lua because nothing else in this document uses a compound data
+	-- expression, and this is not the place to be the first.
+	fpShowSelection = false,
+	fpShowReroll = false,
+	fpHasSelection = false,
+	fpSelectionStr = "none",
 	-- features placer save/load popup
 	fpSaveLoadOpen = false,
 	-- light placer
@@ -2201,7 +2432,7 @@ local initialModel = {
 	noiseType = "perlin",      -- noise type selection
 	mbSubMode = "paint",       -- metal brush sub-mode
 	gbSubMode = "paint",       -- grass brush sub-mode
-	fpSubMode = "scatter",     -- feature placer sub-mode
+	fpSubMode = "point",       -- feature placer sub-mode
 	fpDistMode = "random",     -- feature placer distribution
 	dcLibMode = "",            -- decal library mode (scatter/point/remove)
 	dcDistribution = "random", -- decal distribution (random/regular/clustered)
@@ -2300,8 +2531,8 @@ local initialModel = {
 	-- Phase 2 step 4: feature placer label interpolation strings
 	fpRadiusStr = "200",
 	fpRotationStr = "0",
-	fpRotRandomStr = "100",
-	fpCountStr = "5",
+	fpRotRandomStr = "0",
+	fpCountStr = "1",
 	fpCadenceStr = "1",
 	fpSlopeMaxStr = "45",
 	fpSlopeMinStr = "10",
@@ -2367,6 +2598,7 @@ local initialModel = {
 	penPressureStr = "OFF",
 	wiggleStr = "OFF",
 	disableTipsStr = "OFF",
+	keepAliveStr = "OFF",  -- Settings > General: match end disabled for this session
 	penSensitivityStr = "100",
 	-- Phase 2 step 6: guide toggle active states (data-class-active bindings)
 	djModeActive = false,
@@ -2375,6 +2607,7 @@ local initialModel = {
 	penPressureActive = false,
 	wiggleActive = false,
 	disableTipsActive = false,
+	keepAliveActive = false,
 	-- Phase 2 step 6: sub-panel dj-disabled states (true = grayed out)
 	djSubDisabled = true,
 	penSubDisabled = true,
@@ -3846,24 +4079,22 @@ local initialModel = {
 			listEl.inner_rml = ""
 			local files = WG.FeaturePlacer.listSaves()
 			if #files == 0 then
-				listEl.inner_rml = '<div style="padding: 4dp 6dp; font-size: 0.9rem; color: #6b7280;">No saved feature maps</div>'
+				listEl.inner_rml = '<div class="tf-hm-empty">No saved feature maps</div>'
 			else
+				-- Same row markup as the heightmap browser / Open Project list, and
+				-- hover comes from RCSS :hover: repainting it from mouseover/mouseout
+				-- left the highlight stuck on rows the pointer had already left.
 				for _, filepath in ipairs(files) do
 					local fname = filepath:match("[^/\\]+$") or filepath
 					local item = doc:CreateElement("div")
-					item:SetAttribute("style", "padding: 3dp 6dp; font-size: 0.9rem; color: #9ca3af; cursor: pointer; border-radius: 3dp;")
-					item.inner_rml = fname
+					item:SetClass("tf-hm-row", true)
+					item.inner_rml = '<div class="tf-hm-row-line"><div class="tf-hm-mapname">'
+						.. (fname:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")) .. '</div></div>'
 					item:AddEventListener("click", function(ev)
 						playSound("apply")
 						if WG.FeaturePlacer then WG.FeaturePlacer.load(filepath) end
 						if widgetState.dmHandle then widgetState.dmHandle.fpSaveLoadOpen = false end
 						ev:StopPropagation()
-					end, false)
-					item:AddEventListener("mouseover", function()
-						item:SetAttribute("style", "padding: 3dp 6dp; font-size: 0.9rem; color: #d1d5db; cursor: pointer; border-radius: 3dp; background-color: #2a2a3a;")
-					end, false)
-					item:AddEventListener("mouseout", function()
-						item:SetAttribute("style", "padding: 3dp 6dp; font-size: 0.9rem; color: #9ca3af; cursor: pointer; border-radius: 3dp;")
 					end, false)
 					listEl:AppendChild(item)
 				end
@@ -3888,6 +4119,28 @@ local initialModel = {
 			local cur = (WG.TerraformBrush.getState() or {}).heightSamplingMode
 			WG.TerraformBrush.setHeightSamplingMode(cur == target and nil or target)
 		end
+	end,
+
+	-- Gizmo selection
+	onFpSelectVisible = function(_event)
+		if not (WG.FeaturePlacer and WG.FeaturePlacer.selectAllVisible) then return end
+		playSound("toggleOn")
+		WG.FeaturePlacer.selectAllVisible()
+	end,
+	onFpClearSelection = function(_event)
+		if not (WG.FeaturePlacer and WG.FeaturePlacer.clearSelection) then return end
+		playSound("toggleOff")
+		WG.FeaturePlacer.clearSelection()
+	end,
+	onFpDeleteSelection = function(_event)
+		if not (WG.FeaturePlacer and WG.FeaturePlacer.deleteSelection) then return end
+		playSound("toggleOff")
+		WG.FeaturePlacer.deleteSelection()
+	end,
+	onFpReroll = function(_event)
+		if not (WG.FeaturePlacer and WG.FeaturePlacer.reroll) then return end
+		playSound("toggleOn")
+		WG.FeaturePlacer.reroll()
 	end,
 
 	-- Grid overlay / snap
@@ -4679,7 +4932,9 @@ local initialModel = {
 			d.fileMenuOpen = false
 			d.projectSaveOpen = true
 			d.projectSaveHint = ""
+			d.projectSaveUnits = widgetState.projectSaveUnits and true or false
 		end
+		widgetState.projectUnitsDropArmed = nil
 		-- Prefill: last used name, else the slugified map name.
 		local doc = widgetState.document
 		local inp = doc and doc:GetElementById("input-project-name")
@@ -4695,6 +4950,16 @@ local initialModel = {
 	onProjectSaveClose = function(_event)
 		playSound("click")
 		local d = widgetState.dmHandle; if d then d.projectSaveOpen = false end
+	end,
+	onProjectSaveUnitsToggle = function(_event)
+		playSound("click")
+		widgetState.projectSaveUnits = not widgetState.projectSaveUnits
+		widgetState.projectUnitsDropArmed = nil
+		local d = widgetState.dmHandle
+		if d then
+			d.projectSaveUnits = widgetState.projectSaveUnits
+			d.projectSaveHint = ""
+		end
 	end,
 	onProjectSaveConfirm = function(_event)
 		local d = widgetState.dmHandle
@@ -4721,7 +4986,17 @@ local initialModel = {
 			return
 		end
 		widgetState.projectNameStr = name
-		if WG.MapProject.save(name) then
+		-- Toggle-off re-save of a project that HAS a units loadout would silently
+		-- drop it (stale-section cleanup). Require a second SAVE click to confirm.
+		if not widgetState.projectSaveUnits
+			and widgetState.projectUnitsDropArmed ~= name
+			and WG.MapProject.hasUnitsSection and WG.MapProject.hasUnitsSection(name) then
+			widgetState.projectUnitsDropArmed = name
+			if d then d.projectSaveHint = "'" .. name .. "' includes a units loadout. Saving with the toggle OFF removes it — press SAVE PROJECT again to confirm." end
+			return
+		end
+		widgetState.projectUnitsDropArmed = nil
+		if WG.MapProject.save(name, { saveUnits = widgetState.projectSaveUnits and true or false }) then
 			playSound("save")
 			if d then d.projectSaveHint = "Saving to MapProjects/" .. name .. "/ — progress in console." end
 		else
@@ -4739,52 +5014,140 @@ local initialModel = {
 		end
 		-- Imperative DOM list build (same justification as the feature placer's
 		-- save list: rows are dynamic, data-model arrays are not used here).
+		-- Markup, styling and the date/name/badge layout are shared with the Load
+		-- Heightmap browser (tf-hm-* classes): one atomic inner_rml write, then
+		-- click handlers wired by row id. Hover is RCSS :hover — painting it from
+		-- mouseover/mouseout handlers left highlights stuck on rows the pointer
+		-- had already left.
+		-- Clicking a row only selects it — LOAD and DELETE live at the bottom of
+		-- the dialog, like Save Project and New Map. Neither belongs on a stray
+		-- click in a list: one restarts the session, the other destroys files.
 		local doc = widgetState.document
 		local listEl = doc and doc:GetElementById("tf-project-open-list")
 		if not listEl then return end
-		listEl.inner_rml = ""
-		if not (WG.MapProject and WG.MapProject.listDetailed) then
-			if d then d.projectOpenHint = "Map Project widget is not enabled (Settings > Widgets)." end
-			return
-		end
-		local projects = WG.MapProject.listDetailed()
-		if #projects == 0 then
-			listEl.inner_rml = '<div style="padding: 4dp 6dp; font-size: 0.9rem; color: #6b7280;">'
-				.. 'No projects found in MapProjects/. Projects saved this session may need an engine restart to appear (VFS folder cache).</div>'
-			return
-		end
-		for _, p in ipairs(projects) do
-			local label = string.format("%s&nbsp;&nbsp;<span style=\"color: #6b7280;\">%sx%s&nbsp;&nbsp;%s</span>",
-				p.name or p.slug, tostring(p.size_x or "?"), tostring(p.size_z or "?"),
-				(p.modified or ""):gsub("T", " "):gsub("Z", ""))
-			local item = doc:CreateElement("div")
-			item:SetAttribute("style", "padding: 4dp 6dp; font-size: 0.95rem; color: #9ca3af; cursor: pointer; border-radius: 3dp;")
-			item.inner_rml = label
-			local slug = p.slug
-			item:AddEventListener("click", function(ev)
-				playSound("apply")
-				local dm = widgetState.dmHandle
-				if not (WG.MapProject and WG.MapProject.open) then
-					if dm then dm.projectOpenHint = "Map Project widget is not enabled (Settings > Widgets)." end
-				elseif WG.MapProject.isBusy and WG.MapProject.isBusy() then
-					if dm then dm.projectOpenHint = "A save or load is already running (see console)." end
-				elseif not WG.MapProject.open(slug) then
-					if dm then dm.projectOpenHint = "Could not open '" .. slug .. "' — see console for the reason." end
+		local function rebuild()
+			widgetState.projectOpenRowEls = {}
+			widgetState.projectOpenSelectedSlug = nil
+			widgetState.projectDeleteConfirmExpiry = 0
+			if widgetState.dmHandle then
+				widgetState.dmHandle.projectOpenSelected = ""
+				widgetState.dmHandle.projectDeleteConfirming = false
+			end
+			listEl.inner_rml = ""
+			local dm = widgetState.dmHandle
+			if not (WG.MapProject and WG.MapProject.listDetailed) then
+				listEl.inner_rml = '<div class="tf-hm-empty">Map Project widget is not enabled (Settings &gt; Widgets).</div>'
+				if dm then dm.projectOpenHint = "Map Project widget is not enabled (Settings > Widgets)." end
+				return
+			end
+			local projects = WG.MapProject.listDetailed()
+			if #projects == 0 then
+				listEl.inner_rml = '<div class="tf-hm-empty">'
+					.. 'No projects found in MapProjects/. Projects saved this session may need an engine restart to appear (VFS folder cache).</div>'
+				return
+			end
+			local function esc(s) return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")) end
+			local parts = {}
+			for i, p in ipairs(projects) do
+				-- Manifests stamp ISO-8601 UTC ("2026-07-27T14:22:31Z"); the heightmap
+				-- browser shows "YYYY-MM-DD HH:MM", so drop the seconds and the T/Z.
+				local stamp = tostring(p.modified or "")
+				local y, mo, dd, hh, mi = stamp:match("^(%d+)%-(%d+)%-(%d+)T(%d+):(%d+)")
+				local when = y and string.format("%s-%s-%s %s:%s", y, mo, dd, hh, mi)
+					or (stamp ~= "" and stamp or "(no date)")
+				parts[#parts + 1] = string.format(
+					'<div id="tf-proj-r%d" class="tf-hm-row tf-proj-row"><div class="tf-hm-row-line">'
+					.. '<div class="tf-hm-date">%s</div>'
+					.. '<div class="tf-hm-mapname">%s</div>'
+					.. '<div class="tf-hm-badge">%sx%s</div>'
+					.. '</div></div>',
+					i, esc(when), esc(p.name or p.slug),
+					esc(p.size_x or "?"), esc(p.size_z or "?"))
+			end
+			listEl.inner_rml = table.concat(parts)
+			for i, p in ipairs(projects) do
+				local row = doc:GetElementById("tf-proj-r" .. i)
+				if row then
+					local slug, label = p.slug, (p.name or p.slug)
+					widgetState.projectOpenRowEls[#widgetState.projectOpenRowEls + 1] = { slug = slug, el = row }
+					row:AddEventListener("click", function(ev)
+						ev:StopPropagation()
+						playSound("click")
+						widgetState.projectOpenSelectedSlug = slug
+						-- Picking a different project must not inherit the armed DELETE.
+						widgetState.projectDeleteConfirmExpiry = 0
+						local dm2 = widgetState.dmHandle
+						if dm2 then
+							dm2.projectOpenSelected = label
+							dm2.projectDeleteConfirming = false
+							dm2.projectOpenHint = ""
+						end
+						for _, r in ipairs(widgetState.projectOpenRowEls or {}) do
+							r.el:SetClass("selected", r.slug == slug)
+						end
+					end, false)
 				end
-				ev:StopPropagation()
-			end, false)
-			item:AddEventListener("mouseover", function()
-				item:SetAttribute("style", "padding: 4dp 6dp; font-size: 0.95rem; color: #d1d5db; cursor: pointer; border-radius: 3dp; background-color: #2a2a3a;")
-			end, false)
-			item:AddEventListener("mouseout", function()
-				item:SetAttribute("style", "padding: 4dp 6dp; font-size: 0.95rem; color: #9ca3af; cursor: pointer; border-radius: 3dp;")
-			end, false)
-			listEl:AppendChild(item)
+			end
+		end
+		-- Stashed on widgetState (not a chunk local) so the bottom buttons can
+		-- refresh the list after a delete.
+		widgetState.projectOpenRebuild = rebuild
+		rebuild()
+	end,
+	-- LOAD PROJECT / DELETE act on the selected row. Both are pointer-events:none
+	-- while nothing is selected (data-class-disabled), so neither needs its own
+	-- empty-selection branch beyond the guard below.
+	onProjectOpenLoad = function(_event)
+		local slug = widgetState.projectOpenSelectedSlug
+		if not slug then return end
+		playSound("apply")
+		local d = widgetState.dmHandle
+		if not (WG.MapProject and WG.MapProject.open) then
+			if d then d.projectOpenHint = "Map Project widget is not enabled (Settings > Widgets)." end
+		elseif WG.MapProject.isBusy and WG.MapProject.isBusy() then
+			if d then d.projectOpenHint = "A save or load is already running (see console)." end
+		elseif not WG.MapProject.open(slug) then
+			if d then d.projectOpenHint = "Could not open '" .. slug .. "' — see console for the reason." end
+		end
+	end,
+	-- Two-step, same as FULL RESTORE: first click arms, second commits, Update
+	-- disarms after 3 s.
+	onProjectOpenDelete = function(_event)
+		local slug = widgetState.projectOpenSelectedSlug
+		if not slug then return end
+		local d = widgetState.dmHandle
+		local now = Spring.GetGameSeconds() or 0
+		if (widgetState.projectDeleteConfirmExpiry or 0) > now then
+			widgetState.projectDeleteConfirmExpiry = 0
+			if d then d.projectDeleteConfirming = false end
+			playSound("reset")
+			if not (WG.MapProject and WG.MapProject.delete) then
+				if d then d.projectOpenHint = "Map Project widget is not enabled (Settings > Widgets)." end
+			elseif WG.MapProject.isBusy and WG.MapProject.isBusy() then
+				if d then d.projectOpenHint = "A save or load is already running (see console)." end
+			elseif WG.MapProject.delete(slug) then
+				if d then d.projectOpenHint = "Deleted '" .. slug .. "'." end
+				-- Rebuild next frame, not here: the rebuild destroys the rows while
+				-- this click is still being dispatched.
+				widgetState.projectOpenNeedsRebuild = true
+			else
+				if d then d.projectOpenHint = "Could not delete '" .. slug .. "' — see console for the reason." end
+			end
+		else
+			widgetState.projectDeleteConfirmExpiry = now + 3
+			if d then d.projectDeleteConfirming = true end
+			playSound("toggleOn")
 		end
 	end,
 	onProjectOpenClose = function(_event)
 		playSound("click")
-		local d = widgetState.dmHandle; if d then d.projectOpenOpen = false end
+		local d = widgetState.dmHandle
+		if d then
+			d.projectOpenOpen = false
+			d.projectDeleteConfirming = false
+		end
+		-- Never leave DELETE armed for the next time the dialog opens.
+		widgetState.projectDeleteConfirmExpiry = 0
 	end,
 	-- GENERATE TERRAIN toggle: off (default) creates a dead-flat map; on reveals
 	-- the procedural terrain/water/resources/layout controls and the randomizer.
@@ -5090,7 +5453,7 @@ local initialModel = {
 				if s.tool == "terraform" and WG.TerraformBrush then
 					WG.TerraformBrush.setMode(s.mode or "raise")
 				elseif s.tool == "features" and WG.FeaturePlacer then
-					WG.FeaturePlacer.setMode(s.mode or "scatter")
+					WG.FeaturePlacer.setMode(s.mode or "point")
 				elseif s.tool == "weather" and WG.WeatherBrush then
 					WG.WeatherBrush.setMode(s.mode or "place")
 				elseif s.tool == "splat" and WG.SplatPainter then
@@ -5113,6 +5476,75 @@ local initialModel = {
 				end
 			end
 			playSound("modeSwitch")
+		end
+	end,
+	onToggleMapLabels = function(_event)
+		if not WG.MapLabels then
+			Spring.Echo("[Terraform Brush] Map Labels widget is not loaded")
+			return
+		end
+		local open = WG.MapLabels.toggle()
+		playSound(open and "panelOpen" or "click")
+		local d = widgetState.dmHandle; if d then d.mapLabelsOpen = open end
+	end,
+	onToggleCapture = function(_event)
+		-- Opens even without the capture widget loaded: a window that says what
+		-- to enable beats a button that silently does nothing.
+		widgetState.captureOpen = not widgetState.captureOpen
+		playSound(widgetState.captureOpen and "panelOpen" or "click")
+		local d = widgetState.dmHandle
+		if d then
+			d.captureOpen = widgetState.captureOpen
+			d.captureVisible = widgetState.captureOpen
+		end
+		if widgetState.captureOpen then
+			capUI.sync()
+			capUI.syncSliders()
+		end
+	end,
+	onCaptureClose = function(_event)
+		playSound("click")
+		widgetState.captureOpen = false
+		local d = widgetState.dmHandle
+		if d then d.captureOpen = false; d.captureVisible = false end
+	end,
+	onCaptureSetDetail = function(_event, value)
+		playSound("click")
+		capUI.set("detail", tonumber(value) or 1)
+	end,
+	onCaptureToggle = function(_event, key)
+		playSound("click")
+		local api = WG.TerraformCapture
+		if not (api and api.getSettings) then return end
+		local s = api.getSettings()
+		if s[key] == nil then return end
+		capUI.set(key, not s[key])
+	end,
+	onCaptureSetUnitStyle = function(_event, value)
+		playSound("click")
+		capUI.set("unitStyle", tostring(value))
+	end,
+	onCaptureRun = function(_event)
+		local api = WG.TerraformCapture
+		if not (api and api.start) then
+			playSound("click")
+			capUI.setResult(false, "NOT LOADED",
+				"Enable the \"Terraform Brush Capture\" widget in Settings > Widgets.")
+			return
+		end
+		local ok, err = api.start()
+		if ok then
+			playSound("panelOpen")
+			capUI.setResult(true, "", "")
+		else
+			playSound("click")
+			capUI.setResult(false, "CANNOT START", tostring(err or "could not start"))
+		end
+	end,
+	onCaptureCancel = function(_event)
+		playSound("click")
+		if WG.TerraformCapture and WG.TerraformCapture.cancel then
+			WG.TerraformCapture.cancel()
 		end
 	end,
 	onGuideToggleSettings = function(_event)
@@ -5280,6 +5712,37 @@ local initialModel = {
 				local splatChip = doc2:GetElementById("btn-sp-splat-overlay")
 				if splatChip then splatChip:SetClass("tf-chip-2pulse", false) end
 			end
+		end
+	end,
+	-- Keep match alive (sandbox): disable the two match-end gadgets for this
+	-- session via the gadget handler's cheat-gated "/luarules disablegadget"
+	-- path, so teams survive with zero units and commander death cannot end
+	-- the match. One-way: re-enabling game_end mid-session would rebuild its
+	-- state from the live team roster and could declare gameover instantly.
+	-- The actual sends run in widget:Update (cheat must be OBSERVED on first).
+	onGuideToggleKeepAlive = function(_event)
+		local ka = widgetState.keepAlive
+		if ka and ka.active then
+			playSound("click")
+			Spring.Echo("[Terraform Brush] Match end is already disabled for this session (one-way: re-enabling mid-game could end the match instantly).")
+			return
+		end
+		playSound("toggleOn")
+		widgetState.keepAlive = ka or {}
+		widgetState.keepAlive.pending = true
+	end,
+	-- Remove all units: empty-loadout replace via the map project units gadget
+	-- ($mpunits_begin$ + $mpunits_end$ with no data = wipe). Arms keep-alive
+	-- first — wiping units while game_end is live would end the match.
+	onGuideClearAllUnits = function(_event)
+		playSound("click")
+		local ka = widgetState.keepAlive or {}
+		widgetState.keepAlive = ka
+		ka.clearQueued = true
+		if ka.active then
+			ka.clearDelay = 1
+		else
+			ka.pending = true
 		end
 	end,
 	-- Phase 2 step 6: tf_lights model-king handlers — defined here (not in M.attach)
@@ -6152,7 +6615,7 @@ local initialModel = {
 		clearPassthrough()
 		if not WG.FeaturePlacer then return end
 		_deactivateAllTools()
-		WG.FeaturePlacer.setMode("scatter")
+		WG.FeaturePlacer.setMode("point")
 	end,
 	onTfSwitchWeather = function(_event)
 		playSound("toolSwitch")
@@ -6260,6 +6723,24 @@ local initialModel = {
 			widgetState.tilesetActive = true
 		end
 	end,
+	-- Albedo/normal tiling decoupling on the flat layers: off pins every albTile*
+	-- ratio to 1.0 in the shader, so this is the straight A/B against the coupled
+	-- look without having to reset the three sliders.
+	onTsToggleAlbDecouple = function(_event)
+		if not (WG.TilesetTerrain and WG.TilesetTerrain.setKnob and WG.TilesetTerrain.getKnobs) then return end
+		local knobs = WG.TilesetTerrain.getKnobs()
+		local on = not (knobs and knobs.albDecouple and knobs.albDecouple >= 1)
+		WG.TilesetTerrain.setKnob("albDecouple", on and 1 or 0)
+		playSound(on and "toggleOn" or "toggleOff")
+		widgetState.tsAlbDecoupleLast = on
+		local doc = widgetState.document
+		local el = doc and doc:GetElementById("btn-ts-alb-decouple")
+		if el then
+			el:SetAttribute("src",
+				on and "/luaui/images/terraform_brush/check_on.png"
+				or  "/luaui/images/terraform_brush/check_off.png")
+		end
+	end,
 	onTilesetKnob = function(_event, key)
 		if uiState.updatingFromCode or not WG.TilesetTerrain then return end
 		local v = _elemSliderVal("ts-slider-" .. key, 0)
@@ -6338,6 +6819,22 @@ local initialModel = {
 		if widgetState.tsSkyboxSync and WG.TilesetTerrain and WG.TilesetTerrain.getActiveBiome then
 			local _, _, bkey = WG.TilesetTerrain.getActiveBiome()
 			if bkey then syncSkyboxToBiome(bkey) end
+		end
+	end,
+	-- Master SHADER switch. Off releases the map shader (and the $minimap/$grass
+	-- overrides) back to the engine, so maps that ship hand-authored textures
+	-- render the way they were authored; the tuning sections gray out in M.sync.
+	onTsToggleShader = function(_event)
+		if not (WG.TilesetTerrain and WG.TilesetTerrain.setActive) then return end
+		local was = WG.TilesetTerrain.isActive and WG.TilesetTerrain.isActive()
+		local on = WG.TilesetTerrain.setActive(not was)
+		playSound(on and "toggleOn" or "toggleOff")
+		local doc = widgetState.document
+		local el = doc and doc:GetElementById("btn-ts-shader")
+		if el then
+			el:SetAttribute("src",
+				on and "/luaui/images/terraform_brush/check_on.png"
+				or  "/luaui/images/terraform_brush/check_off.png")
 		end
 	end,
 	-- METAL SPOTS style tiles (mirrors onPickBiome; styles live in the shader
@@ -7438,6 +7935,23 @@ local guideHints = {
 	["btn-fp-alt-max-sample"] = "Sample ground height: click this, then click the map to set Max Altitude to the sampled elevation. Enables Max filter automatically. With the height colormap on, you can click a topo contour line for precise elevation.",
 	["btn-gb-alt-min-sample"] = "Sample ground height: click this, then click the map to set Min Altitude to the sampled elevation. Enables Min filter automatically. With the height colormap on, you can click a topo contour line for precise elevation.",
 	["btn-gb-alt-max-sample"] = "Sample ground height: click this, then click the map to set Max Altitude to the sampled elevation. Enables Max filter automatically. With the height colormap on, you can click a topo contour line for precise elevation.",
+	-- Map labels
+	["btn-maplabels"]   = "Show map comments: colored pins you can place, drag, colour-code and write notes in — for planning and review. Switching it off hides every comment.",
+	-- Capture
+	["btn-capture"]     = "Capture: export a maximum-resolution top-down photo of the whole map, plus a separate SVG layer holding every unit as its own movable image — drop both into Figma to draft a mission.",
+	["btn-capture-run"] = "Fly the camera over the map tile by tile and write the photo, the unit layer and any extra layers into Terraform Brush/Captures. Takes over the camera for a few seconds; Esc cancels.",
+	["btn-capture-water"]         = "Keep the water surface in the photo. Off renders the seabed dry.",
+	["btn-capture-shadows"]       = "Keep terrain and feature shadows in the photo.",
+	["btn-capture-bloom"]         = "Keep the bloom post-process in the photo.",
+	["btn-capture-fog"]           = "Leave the session's fog alone. Off forces fog out of the photo, which is usually what a design document wants.",
+	["btn-capture-photofeatures"] = "Bake trees, rocks and wrecks into the photo. Units are never baked in — they are the separate layer.",
+	["btn-capture-unitlayer"]     = "Write units.svg: one <image> per unit, so Figma imports every unit as its own movable layer over the photo.",
+	["btn-capture-style-portrait"] = "Build pictures in team-coloured tiles, like the zoomed-in minimap. Constant size, easy to read and label.",
+	["btn-capture-style-topdown"]  = "Plan-view renders of the actual models at true world scale and heading. Experimental.",
+	["btn-capture-groupteam"]     = "Put each team's units in their own SVG group, so Figma nests them under one layer per team.",
+	["btn-capture-labels"]        = "Write the unit name under every sprite as SVG text.",
+	["btn-capture-featurelayer"]  = "Also export features as their own SVG layer, movable independently of the photo.",
+	["btn-capture-commentlayer"]  = "Export the map comments as an SVG pin-and-text layer.",
 	-- Restore defaults
 	["btn-defaults"]    = "Reset all brush settings — size, intensity, fall-off curve, rotation, height caps and toggle states — back to their factory defaults.",
 	-- Presets
@@ -7829,6 +8343,7 @@ updateAllKeybindBadges = function()
 			["kbhint-length"]       = "scroll_length",
 			["kbhint-curve"]        = "scroll_curve",
 			["kbhint-fp-size"]      = "scroll_size",
+			["kbhint-fp-rotation"]  = "scroll_rotation",
 			["kbhint-wb-size"]      = "scroll_size",
 			["kbhint-wb-length"]    = "scroll_length",
 			["kbhint-sp-strength"]  = "scroll_intensity",
@@ -8667,6 +9182,30 @@ local function attachEventListeners()
 		end, false)
 	end
 
+	-- Capture window sliders. Both are pure settings (no live scene effect), so
+	-- they just push into WG.TerraformCapture and refresh the readout.
+	local sliderCapSize = getCachedEl(doc, "slider-capture-unitsize")
+	if sliderCapSize then
+		trackSliderDrag(sliderCapSize, "capture-unitsize")
+		sliderCapSize:AddEventListener("change", function(event)
+			if not uiState.updatingFromCode then
+				capUI.set("unitSize", tonumber(sliderCapSize:GetAttribute("value")) or 96)
+			end
+			event:StopPropagation()
+		end, false)
+	end
+
+	local sliderCapScaling = getCachedEl(doc, "slider-capture-unitscaling")
+	if sliderCapScaling then
+		trackSliderDrag(sliderCapScaling, "capture-unitscaling")
+		sliderCapScaling:AddEventListener("change", function(event)
+			if not uiState.updatingFromCode then
+				capUI.set("unitScaling", (tonumber(sliderCapScaling:GetAttribute("value")) or 35) / 100)
+			end
+			event:StopPropagation()
+		end, false)
+	end
+
 	local sliderRotation = getCachedEl(doc, "slider-rotation")
 	if sliderRotation then
 		trackSliderDrag(sliderRotation, "rotation")
@@ -9428,6 +9967,8 @@ local function attachEventListeners()
 				ds.active = false
 				ds.rootEl = nil
 				ds.snapRects = nil
+				-- The window moved, so the room left below it changed.
+				widgetState.refreshPanelBodies()
 			end
 		end, false)
 
@@ -9448,6 +9989,7 @@ local function attachEventListeners()
 		makeWindowDraggable("tf-newmap-handle", getCachedEl(doc, "tf-newmap-root"))
 		makeWindowDraggable("tf-project-handle", getCachedEl(doc, "tf-project-root"))
 		makeWindowDraggable("tf-project-open-handle", getCachedEl(doc, "tf-project-open-root"))
+		makeWindowDraggable("tf-capture-handle", getCachedEl(doc, "tf-capture-root"))
 	end
 
 	-- ===== Transport (auto-scroll) button listeners =====
@@ -9477,6 +10019,19 @@ function widget:Initialize()
 		return false
 	end
 	widgetState.dmHandle = dm
+
+	-- Match-end state for Settings > General: editor canvases start with
+	-- deathmode=neverend (injected by buildBlankMapStartScript) and
+	-- single-allyteam sessions are engine sandbox (game_end removes itself) —
+	-- both mean the keep-alive toggle is already effectively ON.
+	do
+		local allyCount = #Spring.GetAllyTeamList() - 1  -- minus gaia
+		if Spring.GetModOptions().deathmode == "neverend" or allyCount < 2 then
+			widgetState.keepAlive = { active = true }
+			dm.keepAliveStr = "ON"
+			dm.keepAliveActive = true
+		end
+	end
 
 	-- Placeholder fog is obscuring; push it off a few frames after (re)load so new maps
 	-- AND plain luaui reloads come up fog-free until the fog system is replaced.
@@ -10340,6 +10895,9 @@ function widget:DrawScreenPost()
 
 	local logDraw = not widgetState.spPreviewDrawLogged
 
+	-- Clip to the panel's scroll box so a scrolled-out swatch stops painting.
+	local spClipped = widgetState.pushPanelClip(els[1])
+
 	for i = 1, 4 do
 
 		local div = els[i]
@@ -10416,6 +10974,8 @@ function widget:DrawScreenPost()
 
 	widgetState.spPreviewDrawLogged = true
 
+	if spClipped then gl.Scissor(false) end
+
 	if shader then gl.UseShader(0) end
 
 	gl.Blending(true)
@@ -10478,11 +11038,69 @@ end
 function widget:Update()
 	local ok, err = pcall(function()
 
+	-- Keep-match-alive / remove-all-units pump (Settings > General). Both need
+	-- /cheat OBSERVED on: "cheat" TOGGLES, so it is only (re)sent while observed
+	-- off, with a resend gap and an attempt cap (same rule as the project load
+	-- driver). The unit wipe waits a short delay after arming keep-alive because
+	-- the disablegadget chat path and SendLuaRulesMsg are separate channels with
+	-- no cross-ordering guarantee — wiping before game_end is gone would end the
+	-- match on the spot.
+	local ka = widgetState.keepAlive
+	if ka and (ka.pending or ka.clearQueued) then
+		if Spring.IsCheatingEnabled() then
+			ka.cheatSends, ka.lastCheatSend = nil, nil
+			if ka.pending then
+				ka.pending = nil
+				ka.active = true
+				Spring.SendCommands("luarules disablegadget Game End")
+				Spring.SendCommands("luarules disablegadget Team Com Ends")
+				local d = widgetState.dmHandle
+				if d then d.keepAliveStr = "ON"; d.keepAliveActive = true end
+				Spring.Echo("[Terraform Brush] Match end disabled for this session: teams now survive with zero units.")
+				if ka.clearQueued then ka.clearDelay = 90 end
+			end
+			if ka.clearQueued then
+				ka.clearDelay = (ka.clearDelay or 1) - 1
+				if ka.clearDelay <= 0 then
+					ka.clearQueued = nil
+					Spring.SendLuaRulesMsg("$mpunits_begin$")
+					Spring.SendLuaRulesMsg("$mpunits_end$")
+					Spring.Echo("[Terraform Brush] Removing all units from the map...")
+				end
+			end
+		else
+			local now = os.clock()
+			if not ka.lastCheatSend or (now - ka.lastCheatSend) > 5 then
+				if (ka.cheatSends or 0) >= 3 then
+					ka.pending, ka.clearQueued = nil, nil
+					ka.cheatSends, ka.lastCheatSend = nil, nil
+					local d = widgetState.dmHandle
+					if d and not ka.active then d.keepAliveStr = "OFF"; d.keepAliveActive = false end
+					Spring.Echo("[Terraform Brush] Could not enable /cheat — match end protection unchanged. Enable cheats and try again.")
+				else
+					ka.cheatSends = (ka.cheatSends or 0) + 1
+					ka.lastCheatSend = now
+					Spring.SendCommands("cheat")
+				end
+			end
+		end
+	end
+
 	-- One-shot: when map damage is disabled, auto-switch to Features tool on first update
 	if widgetState.noTerraform and not widgetState.noTerraformInitDone and WG.FeaturePlacer then
 		widgetState.noTerraformInitDone = true
 		if WG.TerraformBrush then WG.TerraformBrush.deactivate() end
-		WG.FeaturePlacer.setMode("scatter")
+		WG.FeaturePlacer.setMode("point")
+	end
+
+	-- Mirror the Map Labels window state onto the header button highlight
+	-- (the window can close itself via its own X button)
+	do
+		local d = widgetState.dmHandle
+		if d then
+			local mlOpen = (WG.MapLabels and WG.MapLabels.isOpen()) and true or false
+			if d.mapLabelsOpen ~= mlOpen then d.mapLabelsOpen = mlOpen end
+		end
 	end
 
 	-- Poll-based window drag (position only — mouseup ends drag via doc listener)
@@ -10614,6 +11232,17 @@ function widget:Update()
 		if widgetState.rootElement then
 			widgetState.rootElement:SetAttribute("style", buildRootStyle())
 		end
+		widgetState.refreshPanelBodies()
+	end
+
+	-- A locked slider takes over the mouse wheel (widget:MouseWheel drives it
+	-- from anywhere on screen), so the scrollable panel bodies stand down while
+	-- one is armed instead of fighting over the wheel under the cursor.
+	local pbLocked = next(widgetState.lockedSliders) ~= nil
+	if pbLocked ~= widgetState.panelBodyWheelHeld then
+		widgetState.panelBodyWheelHeld = pbLocked
+		local ts = WG.TerraformerShared
+		if ts and ts.setWheelHeld then ts.setWheelHeld(pbLocked) end
 	end
 
 	local tfState = WG.TerraformBrush and WG.TerraformBrush.getState()
@@ -10741,6 +11370,32 @@ function widget:Update()
 			local showTransforms = clActive and clState and (clState.state == "paste_preview" or clState.state == "copied")
 			setDm("clonePasteTransformsVisible", showTransforms and true or false)
 			setDm("skyboxLibraryVisible", envActive and (widgetState.skyboxLibraryOpen or false))
+
+			-- Capture window: the readout has to track things the window does not
+			-- own (viewport size, another widget cancelling the job), so it is
+			-- refreshed here rather than only on click.
+			if widgetState.captureOpen then
+				local capApi = WG.TerraformCapture
+				local busy = (capApi and capApi.isBusy and capApi.isBusy()) or false
+				setDm("captureBusy", busy)
+				if capApi and capApi.getStatus then
+					local st = capApi.getStatus()
+					setDm("captureProgress", st.message or "")
+					if not busy then
+						if st.error ~= "" then
+							capUI.setResult(false, "FAILED", st.error)
+						elseif st.lastPath ~= "" then
+							capUI.setResult(true, st.lastSummary or "SAVED", st.lastPath)
+						end
+					end
+				end
+				if not busy then
+					local readout, warn = capUI.readout()
+					setDm("captureReadout", readout)
+					setDm("captureWarn", warn)
+				end
+			end
+
 			-- env sub-windows
 			if not envActive then
 				widgetState.envSunOpen = false
@@ -10775,6 +11430,16 @@ function widget:Update()
 			-- erode controls: visible only in erode terraform mode
 			local inErode = tfActive and tfState and tfState.mode == "erode"
 			setDm("tfErodeControlsVisible", not otherToolActive and inErode and true or false)
+			-- Feature SELECTION / Reroll rows sit outside tf-feature-controls (they
+			-- belong above it in the panel), so activeTool does not gate them, and
+			-- their flags are only written by tf_features.sync, which runs for the
+			-- Features tool alone. Clear them here or the last state stays up and
+			-- follows you into whatever tool you switch to.
+			if not fpActive then
+				setDm("fpShowSelection", false)
+				setDm("fpShowReroll", false)
+				setDm("fpHasSelection", false)
+			end
 			-- clay/full-restore visibility
 			local inTfRestore = tfActive and tfState and tfState.mode == "restore"
 			setDm("tfInRestore", inTfRestore and true or false)
@@ -11701,6 +12366,21 @@ function widget:Update()
 			_noDmLabel("mbCleanLabelStr", "CLEAN")
 		end
 	end
+	-- Open Project delete confirm timeout: same 3 s window as FULL RESTORE
+	if (widgetState.projectDeleteConfirmExpiry or 0) > 0 then
+		local now = Spring.GetGameSeconds() or 0
+		if now >= widgetState.projectDeleteConfirmExpiry then
+			widgetState.projectDeleteConfirmExpiry = 0
+			local d = widgetState.dmHandle
+			if d then d.projectDeleteConfirming = false end
+		end
+	end
+	-- Deferred Open Project list refresh (queued by a delete, which cannot
+	-- destroy its own row from inside the click handler)
+	if widgetState.projectOpenNeedsRebuild then
+		widgetState.projectOpenNeedsRebuild = false
+		if widgetState.projectOpenRebuild then widgetState.projectOpenRebuild() end
+	end
 	-- Slider keybind-scroll flash countdown
 	do
 		local sf = widgetState.sliderFlashes
@@ -11856,8 +12536,15 @@ end
 function widget:Shutdown()
 	WG.TerraformBrushUI = nil
 
-	if WG.TerraformerShared and WG.TerraformerShared.unregisterDocument then
-		WG.TerraformerShared.unregisterDocument("terraform_brush")
+	if WG.TerraformerShared then
+		-- Hand the mouse wheel back before leaving: a slider locked at shutdown
+		-- would otherwise leave every sibling panel unable to scroll.
+		if WG.TerraformerShared.setWheelHeld then
+			WG.TerraformerShared.setWheelHeld(false)
+		end
+		if WG.TerraformerShared.unregisterDocument then
+			WG.TerraformerShared.unregisterDocument("terraform_brush")
+		end
 	end
 
 	-- If a text input had focus when we shut down, SDL text-input mode is still
@@ -11878,6 +12565,14 @@ function widget:Shutdown()
 	widgetState.lastInnerRml = {}
 	widgetState.lastAttrValue = {}
 	widgetState.prevSyncValues = {}
+	widgetState.panelBodyWheelHeld = nil
+	-- Open Project row handles belong to the closed document too; a queued
+	-- rebuild must not run against it after shutdown.
+	widgetState.projectOpenRowEls = {}
+	widgetState.projectOpenSelectedSlug = nil
+	widgetState.projectDeleteConfirmExpiry = 0
+	widgetState.projectOpenNeedsRebuild = false
+	widgetState.projectOpenRebuild = nil
 	uiState.draggingSlider = nil
 	uiState.draggingSliderEl = nil
 
