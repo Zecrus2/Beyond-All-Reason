@@ -458,7 +458,7 @@ local function buildUnitCache()
 		update = function(unitID, value)
 			local reclaimMetal = 0
 			local reclaimEnergy = 0
-			local metalMake, metalUse, energyMake, energyUse = Spring.GetUnitResources(unitID)
+			local metalMake, _, energyMake, _ = Spring.GetUnitResources(unitID)
 			if metalMake then
 				if value[1] then
 					reclaimMetal = metalMake - value[1]
@@ -478,7 +478,7 @@ local function buildUnitCache()
 	unitCache.energyConverters = {
 		add = nil,
 		update = function(unitID, value)
-			local metalMake, metalUse, energyMake, energyUse = Spring.GetUnitResources(unitID)
+			local metalMake, _, _, _ = Spring.GetUnitResources(unitID)
 			if metalMake then
 				return metalMake
 			end
@@ -752,13 +752,12 @@ local function calculateWidgetDimensions()
 	widgetDimensions.left = viewScreenWidth - widgetDimensions.width
 
 	widgetDimensions.distanceFromTopBar = mathfloor(defaults.widgetDimensions.distanceFromTopBar * scaleMultiplier)
-	-- Sit under whatever occupies the top right corner: the menu button strip when it
-	-- is shown (its own widget owns that rect), otherwise the top bar, otherwise the
-	-- screen edge.
+	-- Sit under whatever occupies the top right corner: the menu button strip (its own
+	-- widget owns that rect, with no height while auto-hidden), otherwise the top bar,
+	-- otherwise the screen edge.
 	local buttonsArea = WG.topbar and WG.topbar.GetButtonsPosition and WG.topbar.GetButtonsPosition()
 	local topBarPosition = WG.topbar and WG.topbar.GetPosition and WG.topbar.GetPosition()
-	local buttonsShown = WG.topbar and WG.topbar.getShowButtons and WG.topbar.getShowButtons()
-	if buttonsArea and buttonsShown then
+	if buttonsArea then
 		widgetDimensions.top = buttonsArea[2]
 	elseif topBarPosition then
 		widgetDimensions.top = topBarPosition[2]
